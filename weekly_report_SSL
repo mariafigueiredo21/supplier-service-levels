@@ -1,0 +1,207 @@
+"""
+Automated Weekly Excel Report Generator
+---------------------------------------
+
+Purpose:
+    1. Create a weekly report file from a template.
+    2. Update it with the latest data from source reports.
+    3. Refresh Power Query connections.
+    4. Email the final dashboard automatically.
+
+Author: Maria Simões
+Last Updated: 2025-10-16
+"""
+
+import xlwings as xw
+import os
+from datetime import datetime
+import shutil
+import time
+import win32com.client as win32
+import sys
+from PIL import ImageGrab
+from urllib.parse import quote
+
+# --------------------------------------------------------------------------------
+# STEP 1 - FILE PATHS
+# --------------------------------------------------------------------------------
+
+user = os.getlogin()
+
+template_path = fr"C:\Users\{user}\Documents\Weekly_Report_Template.xlsm"
+data_source_path = fr"C:\Users\{user}\Documents\Data\Source_Report_{datetime.today().strftime('%Y%m%d')}.xlsx"
+master_data_path = fr"C:\Users\{user}\Documents\Data\Master_Data_File.xlsm"
+output_folder = fr"C:\Users\{user}\Documents\Weekly_Reports"
+
+if not os.path.exists(data_source_path):
+    print("❌ Source report not found. Please check the data folder.")
+    sys.exit()
+
+# --------------------------------------------------------------------------------
+# STEP 2 - CLEANUP
+# --------------------------------------------------------------------------------
+
+def is_file_open(file_path):
+    """Check if an Excel file is currently open."""
+    try:
+        app = xw.apps.active
+        for wb in app.books:
+            if wb.fullname.lower() == file_path.lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+def close_related_files():
+    """Close template and data files if open."""
+    for path in [template_path, data_source_path, master_data_path]:
+        if is_file_open(path):
+            xw.Book(path).close()
+            print(f"⚠️ Closed file: {path}")
+    print("✅ All required files are ready.")
+
+close_related_files()
+
+# --------------------------------------------------------------------------------
+# STEP 3 - CREATE NEW WEEKLY FILE
+# --------------------------------------------------------------------------------
+
+def create_weekly_file():
+    """Create and populate the new weekly report."""
+    current_week = datetime.today().isocalendar()[1]
+    prev_week = current_week - 1 if current_week > 1 else 52
+    new_filename = f"Weekly_Report_2025_S{prev_week:02d}.xlsm"
+    new_file_path = os.path.join(output_folder, new_filename)
+
+    shutil.copy(template_path, new_file_path)
+    print(f"🆕 Created: {new_filename}")
+
+    app = xw.App(visible=False)
+    wb = app.books.open(new_file_path)
+
+    # Update week references
+    try:
+        ws = wb.sheets["Service Levels"]
+        ws.range("E1").value = f"S{prev_week:02d}"
+        ws.range("F1").value = f"S{current_week:02d}"
+        wb.save()
+        print("✅ Week references updated.")
+    except Exception as e:
+        print(f"⚠️ Error updating week references: {e}")
+
+    # Copy data from source report
+    try:
+        wb_report = xw.Book(data_source_path)
+        ws_src = wb_report.sheets["Weekly_Data"]
+        ws_dest = wb.sheets["Auxiliary"]
+        last_row = ws_src.range("A2").end("down").row
+        ws_dest.range("A5").value = ws_src.range(f"A2:G{last_row}").value
+        wb_report.close()
+        wb.save()
+        print("📊 Data copied from source report.")
+    except Exception as e:
+        print(f"⚠️ Error copying data: {e}")
+
+    # Filtered copy from master data
+    try:
+        week_filter = f"WEEK-{current_week:02d}"
+        wb_master = xw.Book(master_data_path)
+        ws_master = wb_master.sheets["Master"]
+        ws_target = wb.sheets["Next Week"]
+
+        last_row_master = ws_master.range("C" + str(ws_master.cells.last_cell.row)).end("up").row
+        filtered_data = [
+            [ws_master.range(f"F{r}").value, ws_master.range(f"G{r}").value]
+            for r in range(8, last_row_master + 1)
+            if ws_master.range(f"C{r}").value == week_filter
+        ]
+
+        if filtered_data:
+            ws_target.range("A5").value = filtered_data
+            print(f"✅ Filter applied ({week_filter}). Data copied.")
+        else:
+            print(f"⚠️ No data found for {week_filter}.")
+
+        wb_master.close()
+        wb.save()
+    except Exception as e:
+        print(f"⚠️ Error copying from master data: {e}")
+
+    # Refresh data and hide auxiliary sheets
+    try:
+        wb.sheets["Auxiliary"].visible = False
+        wb.sheets["Next Week"].visible = False
+        wb.api.RefreshAll()
+        time.sleep(2)
+        wb.save()
+        print("📈 Data refreshed and sheets hidden.")
+    except Exception as e:
+        print(f"⚠️ Error refreshing data: {e}")
+
+    wb.close()
+    app.quit()
+    print("✅ Weekly report created successfully.")
+    return new_file_path
+
+new_file_path = create_weekly_file()
+
+# --------------------------------------------------------------------------------
+# STEP 4 - EMAIL DASHBOARD
+# --------------------------------------------------------------------------------
+
+def save_clipboard_image(image_path):
+    """Save an image copied from Excel."""
+    time.sleep(1)
+    img = ImageGrab.grabclipboard()
+    if img:
+        img.save(image_path, "PNG")
+    else:
+        raise Exception("❌ No image found in clipboard.")
+
+def send_email_with_dashboard(excel_file, range_str="A1:V43"):
+    """Send an Outlook email with the dashboard image."""
+    try:
+        prev_week = datetime.today().isocalendar()[1] - 1
+        subject = f"[Automation] Weekly Service Level Report S{prev_week:02d}"
+
+        # Example link to your internal system or SharePoint
+        base_url = "https://yourcompany.sharepoint.com/sites/Reports/"
+        file_link = base_url + quote(os.path.basename(excel_file)) + "?web=1"
+
+        excel = win32.DispatchEx("Excel.Application")
+        excel.Visible = False
+        wb = excel.Workbooks.Open(excel_file, ReadOnly=True)
+        ws = wb.Sheets("Dashboard")
+        ws.Range(range_str).CopyPicture(Appearance=1, Format=2)
+
+        image_path = r"C:\temp\dashboard_image.png"
+        save_clipboard_image(image_path)
+
+        outlook = win32.Dispatch("Outlook.Application")
+        mail = outlook.CreateItem(0)
+        mail.Subject = subject
+        mail.To = "team@yourcompany.com"
+        mail.HTMLBody = f"""
+        <p>Hello,</p>
+        <p>Please find attached the weekly service level report.</p>
+        <p><b><a href="{file_link}">Open Weekly Report</a></b></p>
+        <p><img src="cid:dashboard_image"></p>
+        <p>Best regards,<br>Your Analytics Team</p>
+        """
+
+        attachment = mail.Attachments.Add(image_path)
+        attachment.PropertyAccessor.SetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x3712001F",
+            "dashboard_image"
+        )
+
+        mail.Send()
+        print("📧 Email sent successfully!")
+        os.remove(image_path)
+        wb.Close(SaveChanges=False)
+        excel.Quit()
+
+    except Exception as e:
+        print(f"⚠️ Email error: {e}")
+
+send_email_with_dashboard(new_file_path, range_str="A1:V43")
